@@ -236,6 +236,49 @@ def _format_problems_output(json_text: str):
         print(f"Format error: {e}")
         print(json_text)
 
+def _format_discover_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        rows = data.get("rows", [])
+        days = data.get("days", 30)
+        
+        print(f"System Discovery (last {days} days)")
+        print(f"Found {len(rows)} system/LPAR/processor combinations\n")
+        
+        # Group by system
+        systems = {}
+        for row in rows:
+            sys_id = row.get("MVS_SYSTEM_ID", "").strip()
+            lpar = row.get("LPAR_NAME", "").strip() or "[No LPAR]"
+            proc_type = row.get("PROCESSOR_TYPE", "").strip() or "[No Type]"
+            count = row.get("count", 0)
+            
+            if sys_id not in systems:
+                systems[sys_id] = []
+            systems[sys_id].append({"lpar": lpar, "proc_type": proc_type, "count": count})
+        
+        # Display by system
+        for sys_id, configs in systems.items():
+            print(f"System: {sys_id}")
+            
+            # Sort by count descending to show most active first
+            configs.sort(key=lambda x: x["count"], reverse=True)
+            
+            for config in configs[:10]:  # Show top 10 per system
+                print(f"  - LPAR: {config['lpar']}, Type: {config['proc_type']} ({config['count']} records)")
+                
+            if len(configs) > 10:
+                print(f"  ... and {len(configs)-10} more configurations")
+            print()
+                
+    except Exception as e:
+        print(f"Format error: {e}")
+        print(json_text)
+
 async def _direct_call(tools, name: str, args: dict):
     t = await _get_tool_by_name(tools, name)
     if not t:
@@ -267,6 +310,8 @@ async def _direct_call(tools, name: str, args: dict):
             _format_all_systems_output(text)
         elif name == "db2.problem_areas":
             _format_problems_output(text)
+        elif name == "db2.discover_context":
+            _format_discover_output(text)
         else:
             print(text)
     finally:
