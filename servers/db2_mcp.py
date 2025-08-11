@@ -187,6 +187,141 @@ SCHEMA_MANIFEST = {
 # -----------------------------------------------------------------------------
 mcp = FastMCP("izpca-db2-health-minimal")
 
+@mcp.tool(
+    name="db2.management_summary", 
+    description="Executive summary for management - translates technical issues into business impact language. Use when user asks for 'summary for boss', 'executive summary', or 'management report'."
+)
+def management_summary(days: int = 7, system_id: str = None) -> TextContent:
+    t0 = time.time()
+    try:
+        # Get the same data as problem_areas but with business context
+        where_clauses = [
+            "rv.DATE >= CURRENT DATE - ? DAYS",
+            "rv.RULE_LEVEL >= 2"
+        ]
+        params = [int(days)]
+        
+        if system_id:
+            where_clauses.append("rv.MVS_SYSTEM_ID = ?")
+            params.append(system_id.upper())
+        
+        summary_sql = f"""
+            SELECT rv.MVS_SYSTEM_ID,
+                   rv.RULE_GROUP,
+                   COUNT(CASE WHEN rv.RULE_LEVEL >= 3 THEN 1 END) as CRITICAL_COUNT,
+                   COUNT(CASE WHEN rv.RULE_LEVEL = 2 THEN 1 END) as WARNING_COUNT
+            FROM {DATA_SCHEMA}.KPMZ_RULE_VALUES_V rv
+            WHERE {" AND ".join(where_clauses)}
+            GROUP BY rv.MVS_SYSTEM_ID, rv.RULE_GROUP
+            ORDER BY CRITICAL_COUNT DESC, WARNING_COUNT DESC
+            WITH UR
+        """
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(summary_sql, params)
+            rows = cur.fetchall()
+        
+        # Business impact mapping
+        rule_group_impact = {
+            "DB2Z": {
+                "name": "Database Performance",
+                "business_impact": "Customer transaction slowdowns, potential revenue loss",
+                "urgency": "HIGH - affects customer experience directly",
+                "typical_resolution": "2-4 hours with DBA intervention"
+            },
+            "DASD": {
+                "name": "Storage Systems", 
+                "business_impact": "System slowdowns, potential outages during peak usage",
+                "urgency": "HIGH - risk of complete system unavailability",
+                "typical_resolution": "4-8 hours, may require hardware intervention"
+            },
+            "LPAR": {
+                "name": "Resource Allocation",
+                "business_impact": "Inefficient resource usage, increased operational costs", 
+                "urgency": "MEDIUM - optimize during next maintenance window",
+                "typical_resolution": "1-2 hours configuration changes"
+            },
+            "WORK": {
+                "name": "Workload Management",
+                "business_impact": "Reduced system throughput, longer processing times",
+                "urgency": "MEDIUM - monitor and schedule optimization",
+                "typical_resolution": "2-4 hours tuning and testing"
+            },
+            "SYID": {
+                "name": "System Configuration",
+                "business_impact": "Configuration drift, compliance risks",
+                "urgency": "LOW - address in planned maintenance",
+                "typical_resolution": "1-2 hours administrative changes"
+            }
+        }
+        
+        # Process data for business summary
+        business_issues = []
+        total_critical = 0
+        total_warnings = 0
+        systems_affected = set()
+        
+        for row in rows:
+            sys_id = _py(row[0]).strip()
+            rule_group = _py(row[1]).strip() 
+            critical = int(_py(row[2]) or 0)
+            warnings = int(_py(row[3]) or 0)
+            
+            if critical > 0 or warnings > 0:
+                systems_affected.add(sys_id)
+                total_critical += critical
+                total_warnings += warnings
+                
+                impact_info = rule_group_impact.get(rule_group, {
+                    "name": rule_group,
+                    "business_impact": "System performance impact",
+                    "urgency": "MEDIUM - requires investigation", 
+                    "typical_resolution": "2-6 hours technical analysis"
+                })
+                
+                business_issues.append({
+                    "system": sys_id,
+                    "area": impact_info["name"],
+                    "critical": critical,
+                    "warnings": warnings,
+                    "impact": impact_info["business_impact"],
+                    "urgency": impact_info["urgency"],
+                    "resolution_time": impact_info["typical_resolution"]
+                })
+        
+        # Calculate business risk
+        risk_level = "LOW"
+        
+        if total_critical > 100:
+            risk_level = "CRITICAL"
+        elif total_critical > 50:
+            risk_level = "HIGH" 
+        elif total_critical > 10:
+            risk_level = "MEDIUM"
+        
+        return _json_text({
+            "ok": True,
+            "days": int(days),
+            "system_filter": system_id.upper() if system_id else "ALL_SYSTEMS",
+            "executive_summary": {
+                "total_critical_issues": total_critical,
+                "total_warning_issues": total_warnings,
+                "systems_affected": len(systems_affected),
+                "business_risk_level": risk_level,
+                "systems_list": list(systems_affected)
+            },
+            "business_issues": business_issues[:3],  # Top 3 for brevity
+            "recommendations": {
+                "immediate_action": "Address critical issues on affected systems",
+                "timeframe": "Next 4-24 hours",
+                "resources_needed": "Technical teams and possible vendor support"
+            },
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
 @mcp.tool(name="db2.explain_health_levels", description="Explain what health levels 0-4 mean in IZPCA monitoring")
 def explain_health_levels() -> TextContent:
     explanation = {
