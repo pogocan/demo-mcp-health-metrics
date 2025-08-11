@@ -187,6 +187,22 @@ SCHEMA_MANIFEST = {
 # -----------------------------------------------------------------------------
 mcp = FastMCP("izpca-db2-health-minimal")
 
+@mcp.tool(name="db2.explain_health_levels", description="Explain what health levels 0-4 mean in IZPCA monitoring")
+def explain_health_levels() -> TextContent:
+    explanation = {
+        "ok": True,
+        "health_levels": {
+            "0": {"name": "Not Applicable", "description": "Rule does not apply to this system/component"},
+            "1": {"name": "Good", "description": "Healthy - no issues detected"},
+            "2": {"name": "Warning", "description": "Needs monitoring - potential issue"},
+            "3": {"name": "Critical", "description": "Requires immediate attention"},
+            "4": {"name": "Severe Critical", "description": "Urgent - system may be at risk"}
+        },
+        "summary": "Levels 0-1 are normal, level 2 needs monitoring, levels 3+ require action",
+        "usage": "Use db2.problem_areas to see only levels 2+ that need attention"
+    }
+    return _json_text(explanation)
+
 @mcp.tool(name="db2.healthcheck", description="Connectivity probe via SYSIBM.SYSDUMMY1")
 def healthcheck() -> TextContent:
     t0 = time.time()
@@ -407,56 +423,85 @@ def all_systems_health(days: int = 7, max_rows: int = 100) -> TextContent:
 
 @mcp.tool(
     name="db2.problem_areas",
-    description="Show only critical and warning issues that need attention. Use when user asks 'what needs attention' or 'what are the problems'."
+    description="Show executive summary of critical and warning issues that need attention. Use when user asks 'what needs attention' or 'what are the problems'."
 )
-def problem_areas(days: int = 7, max_rows: int = 50) -> TextContent:
+def problem_areas(days: int = 7, max_rows: int = 10) -> TextContent:
     t0 = time.time()
     try:
-        sql = f"""
+        # Get summary by system and rule group first
+        summary_sql = f"""
+            SELECT rv.MVS_SYSTEM_ID,
+                   rv.RULE_GROUP,
+                   COUNT(CASE WHEN rv.RULE_LEVEL >= 3 THEN 1 END) as CRITICAL_COUNT,
+                   COUNT(CASE WHEN rv.RULE_LEVEL = 2 THEN 1 END) as WARNING_COUNT
+            FROM {DATA_SCHEMA}.KPMZ_RULE_VALUES_V rv
+            WHERE rv.DATE >= CURRENT DATE - {int(days)} DAYS
+              AND rv.RULE_LEVEL >= 2
+            GROUP BY rv.MVS_SYSTEM_ID, rv.RULE_GROUP
+            HAVING COUNT(*) > 0
+            ORDER BY CRITICAL_COUNT DESC, WARNING_COUNT DESC
+            WITH UR
+        """
+        
+        # Get top specific issues
+        detail_sql = f"""
             SELECT rv.MVS_SYSTEM_ID,
                    rv.RULE_GROUP,
                    rv.RULE_ID,
                    r.RULE_DESCRIPTION,
-                   rv.RULE_AREA,
-                   rv.RULE_VALUE,
                    rv.RULE_LEVEL,
                    rv.DATE
             FROM {DATA_SCHEMA}.KPMZ_RULE_VALUES_V rv
             JOIN {DATA_SCHEMA}.KPMZ_RULES r ON rv.RULE_ID = r.RULE_ID
             WHERE rv.DATE >= CURRENT DATE - {int(days)} DAYS
-              AND rv.RULE_LEVEL >= 2
-            ORDER BY rv.RULE_LEVEL DESC, rv.MVS_SYSTEM_ID, rv.DATE DESC
+              AND rv.RULE_LEVEL >= 3
+            ORDER BY rv.RULE_LEVEL DESC, rv.DATE DESC
             FETCH FIRST {int(max_rows)} ROWS ONLY
             WITH UR
         """
-        with _db2_conn() as conn, conn.cursor() as cur:
-            cur.execute(sql)
-            rows = cur.fetchall()
         
-        problems = [{
+        with _db2_conn() as conn, conn.cursor() as cur:
+            # Get summary by system/rule group
+            cur.execute(summary_sql)
+            summary_rows = cur.fetchall()
+            
+            # Get top critical issues
+            cur.execute(detail_sql)
+            detail_rows = cur.fetchall()
+        
+        # Process summary
+        system_summary = [{
+            "system_id": _py(r[0]).strip(),
+            "rule_group": _py(r[1]).strip(),
+            "critical": int(_py(r[2]) or 0),
+            "warnings": int(_py(r[3]) or 0)
+        } for r in summary_rows]
+        
+        # Process top critical issues
+        top_issues = [{
             "system_id": _py(r[0]).strip(),
             "rule_group": _py(r[1]).strip(),
             "rule_id": _py(r[2]).strip(),
             "description": _py(r[3]).strip() if _py(r[3]) else "",
-            "area": _py(r[4]).strip() if _py(r[4]) else "",
-            "value": float(_py(r[5]) or 0),
-            "severity": "CRITICAL" if int(_py(r[6]) or 0) >= 3 else "WARNING",
-            "level": int(_py(r[6]) or 0),
-            "date": str(_py(r[7])) if _py(r[7]) else ""
-        } for r in rows]
+            "level": int(_py(r[4]) or 0),
+            "date": str(_py(r[5])) if _py(r[5]) else ""
+        } for r in detail_rows]
         
-        critical_count = sum(1 for p in problems if p["level"] >= 3)
-        warning_count = sum(1 for p in problems if p["level"] == 2)
+        # Calculate totals
+        total_critical = sum(s["critical"] for s in system_summary)
+        total_warnings = sum(s["warnings"] for s in system_summary)
         
         return _json_text({
             "ok": True,
             "days": int(days),
-            "summary": {
-                "total_problems": len(problems),
-                "critical": critical_count,
-                "warnings": warning_count
+            "executive_summary": {
+                "total_critical": total_critical,
+                "total_warnings": total_warnings,
+                "systems_affected": len(set(s["system_id"] for s in system_summary)),
+                "priority_systems": [s for s in system_summary if s["critical"] > 0][:3]
             },
-            "problems": problems,
+            "system_breakdown": system_summary[:10],
+            "top_critical_issues": top_issues,
             "ms": int((time.time() - t0) * 1000)
         })
     except Exception as e:

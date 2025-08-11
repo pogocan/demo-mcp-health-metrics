@@ -42,9 +42,18 @@ OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3:14b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:28114")
 
 SYSTEM_HINT = (
-    "You have DB2 health monitoring tools available.\n"
-    "If a query needs system/LPAR/processor IDs and they are not provided,\n"
-    "call `db2.discover_context(days=30)` first. Prefer concise answers and do not reveal <think>.\n"
+    "You have DB2 mainframe health monitoring tools available.\n\n"
+    "HEALTH LEVELS (always explain when first mentioned):\n"
+    "- Level 0: Not Applicable\n"
+    "- Level 1: Good (healthy)\n"
+    "- Level 2: Warning (needs monitoring)\n"
+    "- Level 3+: Critical (requires immediate attention)\n\n"
+    "USAGE TIPS:\n"
+    "- If a query needs system/LPAR/processor IDs and they are not provided, call `db2.discover_context(days=30)` first\n"
+    "- When user asks about 'rules' or 'what rules exist', use the schema manifest tool\n"
+    "- Always provide executive summaries before detailed analysis\n"
+    "- Suggest next steps when appropriate\n"
+    "- Prefer concise answers and do not reveal <think>\n"
 )
 
 def strip_think(text: str) -> str:
@@ -69,6 +78,138 @@ def _summarize_manifest(manifest: dict) -> str:
         out.append(f"{tbl}: {', '.join(keys)}")
     return "\n".join(out) or "(no tables)"
 
+def _format_systems_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"❌ Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        systems = data.get("systems", [])
+        days = data.get("days", 7)
+        
+        print(f"📊 **Mainframe Systems** (last {days} days)")
+        print(f"**Total systems:** {len(systems)}\n")
+        
+        for i, sys in enumerate(systems, 1):
+            critical = sys['critical_issues']
+            warnings = sys['warnings']
+            total = sys['total_records']
+            status = "🔴" if critical > 0 else "🟡" if warnings > 0 else "🟢"
+            
+            print(f"{i}. **{sys['system_id']}** {status}")
+            print(f"   - Records: {total:,}")
+            print(f"   - Critical: {critical}")
+            print(f"   - Warnings: {warnings}\n")
+            
+    except Exception as e:
+        print(f"❌ Format error: {e}")
+        print(json_text)
+
+def _format_system_health_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"❌ Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        system_id = data.get("system_id")
+        summary = data.get("summary", {})
+        rule_groups = data.get("rule_groups", [])
+        days = data.get("days", 7)
+        
+        total = summary.get("total", 0)
+        critical = summary.get("critical", 0)
+        warning = summary.get("warning", 0)
+        good = summary.get("good", 0)
+        
+        crit_pct = (critical / total * 100) if total > 0 else 0
+        warn_pct = (warning / total * 100) if total > 0 else 0
+        
+        print(f"🏥 **System {system_id} Health** (last {days} days)")
+        print(f"**Overall:** {total:,} rules checked")
+        print(f"- 🔴 Critical: {critical} ({crit_pct:.1f}%)")
+        print(f"- 🟡 Warnings: {warning} ({warn_pct:.1f}%)")
+        print(f"- 🟢 Good: {good}\n")
+        
+        if rule_groups:
+            print("**By Rule Group:**")
+            for rg in rule_groups:
+                if rg['critical'] > 0 or rg['warning'] > 0:
+                    status = "🔴" if rg['critical'] > 0 else "🟡"
+                    print(f"- **{rg['rule_group']}** {status}: {rg['critical']} critical, {rg['warning']} warnings")
+                    
+    except Exception as e:
+        print(f"❌ Format error: {e}")
+        print(json_text)
+
+def _format_all_systems_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"❌ Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        systems_summary = data.get("systems_summary", {})
+        days = data.get("days", 7)
+        
+        print(f"🌍 **Estate-Wide Health Overview** (last {days} days)")
+        print(f"**Systems:** {len(systems_summary)}\n")
+        
+        for sys_id, summary in systems_summary.items():
+            critical = summary.get("critical", 0)
+            warning = summary.get("warning", 0)
+            total = summary.get("total", 0)
+            status = "🔴" if critical > 0 else "🟡" if warning > 0 else "🟢"
+            
+            print(f"**{sys_id}** {status}: {critical} critical, {warning} warnings ({total:,} total)")
+            
+    except Exception as e:
+        print(f"❌ Format error: {e}")
+        print(json_text)
+
+def _format_problems_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"❌ Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        exec_summary = data.get("executive_summary", {})
+        system_breakdown = data.get("system_breakdown", [])
+        top_issues = data.get("top_critical_issues", [])
+        days = data.get("days", 7)
+        
+        total_critical = exec_summary.get("total_critical", 0)
+        total_warnings = exec_summary.get("total_warnings", 0)
+        systems_affected = exec_summary.get("systems_affected", 0)
+        priority_systems = exec_summary.get("priority_systems", [])
+        
+        print(f"⚠️  **IMMEDIATE ATTENTION NEEDED** (last {days} days)")
+        print(f"**Executive Summary:**")
+        print(f"- 🔴 Critical Issues: {total_critical}")
+        print(f"- 🟡 Warning Issues: {total_warnings}")
+        print(f"- 🖥️ Systems Affected: {systems_affected}\n")
+        
+        if priority_systems:
+            print("**Priority Systems (Most Critical):**")
+            for i, sys in enumerate(priority_systems, 1):
+                print(f"{i}. **{sys['system_id']}** {sys['rule_group']}: {sys['critical']} critical, {sys['warnings']} warnings")
+            print()
+        
+        if top_issues:
+            print("**Top Critical Issues:**")
+            for i, issue in enumerate(top_issues[:5], 1):
+                print(f"{i}. **{issue['system_id']}** 🔴 {issue['rule_group']}: {issue['description'][:50]}...")
+                
+            if len(top_issues) > 5:
+                print(f"\n*... and {len(top_issues)-5} more critical issues*")
+            print("\n*Ask 'What specific issues need attention?' for detailed analysis*")
+                
+    except Exception as e:
+        print(f"❌ Format error: {e}")
+        print(json_text)
+
 async def _direct_call(tools, name: str, args: dict):
     t = await _get_tool_by_name(tools, name)
     if not t:
@@ -76,7 +217,18 @@ async def _direct_call(tools, name: str, args: dict):
         return
     res = await t.ainvoke(args)
     text = res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
-    print(text)
+    
+    # Format specific tool outputs for better UX
+    if name == "db2.show_systems":
+        _format_systems_output(text)
+    elif name == "db2.system_health":
+        _format_system_health_output(text)
+    elif name == "db2.all_systems_health":
+        _format_all_systems_output(text)
+    elif name == "db2.problem_areas":
+        _format_problems_output(text)
+    else:
+        print(text)
 
 async def repl(tools, llm):
     agent = create_react_agent(llm, tools)
@@ -86,7 +238,7 @@ async def repl(tools, llm):
     if manifest:
         sys_msgs.append(SystemMessage(content=f"DB2_SCHEMA_MANIFEST:\n{json.dumps(manifest, separators=(',',':'))}"))
 
-    print("\nCommands: /tools  /health  /toy  /systems [days]  /health [system_id]  /problems  /ids [days]  /manifest  /call <tool> <json>  /help  /exit")
+    print("\nCommands: /tools  /health  /systems [days]  /health [system_id]  /problems  /ids [days]  /manifest  /call <tool> <json>  /help  /exit")
     print("Tip: free text → agent with all tools.\n")
 
     while True:
@@ -105,7 +257,7 @@ async def repl(tools, llm):
             break
 
         if q.lower().startswith("/help"):
-            print("Commands: /tools  /health  /toy  /systems [days]  /health [system_id]  /problems  /ids [days]  /manifest  /call <tool> <json>  /exit")
+            print("Commands: /tools  /health  /systems [days]  /health [system_id]  /problems  /ids [days]  /manifest  /call <tool> <json>  /exit")
             continue
 
         if q.lower().startswith("/tools"):
