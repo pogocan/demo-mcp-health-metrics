@@ -23,7 +23,7 @@ import jaydebeapi
 from jpype import JClass
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent
+from mcp.types import TextContent, Resource
 
 HERE = pathlib.Path(__file__).resolve().parent
 load_dotenv(HERE / ".env", override=True)
@@ -316,6 +316,564 @@ def management_summary(days: int = 7, system_id: str = None) -> TextContent:
                 "timeframe": "Next 4-24 hours",
                 "resources_needed": "Technical teams and possible vendor support"
             },
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
+@mcp.tool(
+    name="db2.installed_components", 
+    description="List main components and their installation status. Shows high-level components like DB2, CICS, etc. Use when user asks 'what components are installed'."
+)
+def installed_components() -> TextContent:
+    t0 = time.time()
+    try:
+        sql = f"""
+            SELECT COMPONENT_NAME, STATUS, DESCRIPTION, TIME_INSTALLED, USER_ID
+            FROM {METADATA_SCHEMA}.DRLCOMPONENTS
+            ORDER BY COMPONENT_NAME
+            WITH UR
+        """
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        
+        components = []
+        for row in rows:
+            components.append({
+                "component_name": _py(row[0]).strip() if _py(row[0]) else "",
+                "status": _py(row[1]).strip() if _py(row[1]) else "",
+                "description": _py(row[2]).strip() if _py(row[2]) else "",
+                "time_installed": str(_py(row[3])) if _py(row[3]) else "",
+                "user_id": _py(row[4]).strip() if _py(row[4]) else ""
+            })
+        
+        # Categorize by status (I=Installed, empty=Not Installed)
+        installed = [c for c in components if c["status"] == "I"]
+        not_installed = [c for c in components if c["status"] == ""]
+        other_status = [c for c in components if c["status"] not in ["I", ""]]
+        
+        return _json_text({
+            "ok": True,
+            "total_components": len(components),
+            "installed_count": len(installed),
+            "not_installed_count": len(not_installed),
+            "other_status_count": len(other_status),
+            "installed_components": installed,
+            "not_installed_components": not_installed,
+            "other_status_components": other_status,
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
+@mcp.tool(
+    name="db2.find_components",
+    description="Search for all components related to a technology (e.g., 'DB2' finds DB2, ADB2, KPM_DB2, CP_DB2, etc.). Use when user asks 'what DB2 components' or 'CICS related components'."
+)
+def find_components(search_pattern: str) -> TextContent:
+    t0 = time.time()
+    try:
+        sql = f"""
+            SELECT COMPONENT_NAME, STATUS, DESCRIPTION, TIME_INSTALLED, USER_ID
+            FROM {METADATA_SCHEMA}.DRLCOMPONENTS
+            WHERE UPPER(COMPONENT_NAME) LIKE ? OR UPPER(DESCRIPTION) LIKE ?
+            ORDER BY COMPONENT_NAME
+            WITH UR
+        """
+        
+        pattern = f"%{search_pattern.upper()}%"
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, [pattern, pattern])
+            rows = cur.fetchall()
+        
+        components = []
+        for row in rows:
+            components.append({
+                "component_name": _py(row[0]).strip() if _py(row[0]) else "",
+                "status": _py(row[1]).strip() if _py(row[1]) else "",
+                "description": _py(row[2]).strip() if _py(row[2]) else "",
+                "time_installed": str(_py(row[3])) if _py(row[3]) else "",
+                "user_id": _py(row[4]).strip() if _py(row[4]) else ""
+            })
+        
+        # Categorize by status and group by aspect
+        installed = [c for c in components if c["status"] == "I"]
+        not_installed = [c for c in components if c["status"] == ""]
+        other_status = [c for c in components if c["status"] not in ["I", ""]]
+        
+        # Group components by their aspect/purpose
+        def categorize_component(comp_name, description):
+            name_upper = comp_name.upper()
+            desc_upper = description.upper()
+            
+            if any(x in name_upper for x in ["AKD", "KPM"]) or "KEY PERFORMANCE" in desc_upper:
+                return "Performance Monitoring"
+            elif any(x in name_upper for x in ["ADB2", "AZPM"]) or "ANALYTICS" in desc_upper:
+                return "Analytics"
+            elif any(x in name_upper for x in ["CP_"]) or "CAPACITY PLANNING" in desc_upper:
+                return "Capacity Planning"
+            elif "MON" in name_upper or "MONITORING" in desc_upper:
+                return "Monitoring"
+            elif name_upper == search_pattern.upper():
+                return "Core Component"
+            else:
+                return "Other/Extension"
+        
+        # Group installed components by aspect
+        installed_by_aspect = {}
+        for comp in installed:
+            aspect = categorize_component(comp["component_name"], comp["description"])
+            if aspect not in installed_by_aspect:
+                installed_by_aspect[aspect] = []
+            installed_by_aspect[aspect].append(comp)
+        
+        # Group not installed components by aspect  
+        not_installed_by_aspect = {}
+        for comp in not_installed:
+            aspect = categorize_component(comp["component_name"], comp["description"])
+            if aspect not in not_installed_by_aspect:
+                not_installed_by_aspect[aspect] = []
+            not_installed_by_aspect[aspect].append(comp)
+        
+        # Add priority analysis for found components
+        def get_component_priority(comp_name, search_term):
+            # Technology mapping
+            tech_map = {
+                "DB2": "DB2", "CICS": "CICS", "MVS": "z/OS_SYSTEM", "IMS": "IMS", 
+                "NETWORK": "NETWORK", "NW": "NETWORK"
+            }
+            
+            # Determine technology from search pattern or component name
+            technology = None
+            for key, tech in tech_map.items():
+                if key.upper() in search_term.upper() or key.upper() in comp_name.upper():
+                    technology = tech
+                    break
+            
+            if not technology:
+                return "UNKNOWN"
+            
+            # Priority mapping (from resources - this is static for now but could be dynamic)
+            priorities = {
+                "DB2": {
+                    "ESSENTIAL": ["DB2"],
+                    "IMPORTANT": ["KPMDB2", "AKD"], 
+                    "USEFUL": ["CP_DB2", "ADB2"],
+                    "OPTIONAL": ["CSWKDPS"]
+                },
+                "CICS": {
+                    "ESSENTIAL": ["CICSMON"],
+                    "IMPORTANT": ["CICSUOW", "AKC"],
+                    "USEFUL": ["CP_CICS", "OMEG_CICSMON"]
+                },
+                "z/OS_SYSTEM": {
+                    "ESSENTIAL": ["MVS", "KPMZOS"],
+                    "IMPORTANT": ["MVSPERF", "DFSMS"],
+                    "USEFUL": ["CP", "MVSAC"]
+                }
+            }
+            
+            tech_priorities = priorities.get(technology, {})
+            for priority, components in tech_priorities.items():
+                if comp_name in components:
+                    return priority
+            return "USEFUL"  # Default priority
+        
+        # Enhance components with priority information
+        for comp in installed + not_installed:
+            comp["priority"] = get_component_priority(comp["component_name"], search_pattern)
+        
+        # Create priority-based recommendations
+        recommendations = []
+        if not_installed:
+            # Find missing essential/important components
+            missing_essential = [c for c in not_installed if c["priority"] == "ESSENTIAL"]
+            missing_important = [c for c in not_installed if c["priority"] == "IMPORTANT"]
+            
+            if missing_essential:
+                recommendations.append({
+                    "type": "CRITICAL_MISSING",
+                    "message": f"Missing ESSENTIAL components: {[c['component_name'] for c in missing_essential]}",
+                    "action": "Install immediately for basic monitoring"
+                })
+            
+            if missing_important:
+                recommendations.append({
+                    "type": "RECOMMENDED",
+                    "message": f"Missing IMPORTANT KPM components: {[c['component_name'] for c in missing_important]}",
+                    "action": "Highly recommended for performance monitoring"
+                })
+        
+        return _json_text({
+            "ok": True,
+            "search_pattern": search_pattern,
+            "total_found": len(components),
+            "installed_count": len(installed),
+            "not_installed_count": len(not_installed),
+            "other_status_count": len(other_status),
+            "installed_by_aspect": installed_by_aspect,
+            "not_installed_by_aspect": not_installed_by_aspect,
+            "other_status_components": other_status,
+            "recommendations": recommendations,
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
+@mcp.tool(
+    name="db2.component_recommendations",
+    description="Get intelligent component installation recommendations based on usage patterns and priorities. Use when user asks 'what should I install' or 'component recommendations'."
+)
+def component_recommendations(focus_area: str = "performance") -> TextContent:
+    t0 = time.time()
+    try:
+        # Get all installed components first
+        sql = f"""
+            SELECT COMPONENT_NAME, STATUS, DESCRIPTION, TIME_INSTALLED, USER_ID
+            FROM {METADATA_SCHEMA}.DRLCOMPONENTS
+            ORDER BY COMPONENT_NAME
+            WITH UR
+        """
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        
+        components = []
+        for row in rows:
+            components.append({
+                "component_name": _py(row[0]).strip() if _py(row[0]) else "",
+                "status": _py(row[1]).strip() if _py(row[1]) else "",
+                "description": _py(row[2]).strip() if _py(row[2]) else ""
+            })
+        
+        installed = [c["component_name"] for c in components if c["status"] == "I"]
+        
+        # Component priority matrix based on focus area
+        focus_recommendations = {
+            "performance": {
+                "essential": ["KPMZOS", "MVS"],  # KPM z/OS + basic system monitoring
+                "high_priority": ["KPMDB2", "KPMCIC", "DFSMS", "DB2", "CICSMON"],  # Technology-specific KPM + basic monitoring
+                "useful": ["MVSPERF", "CICSUOW", "AKD", "AKC"],  # Advanced performance tools
+                "description": "Performance monitoring and management focus"
+            },
+            "capacity": {
+                "essential": ["CP", "MVS"],  # Core capacity planning + basic system
+                "high_priority": ["CP_DB2", "CP_CICS", "DFSMS"],  # Technology-specific capacity planning
+                "useful": ["CP_IMS", "MVSAC", "KPMZOS"],  # Additional capacity tools + system KPM
+                "description": "Capacity planning and resource optimization focus"
+            },
+            "database": {
+                "essential": ["KPMDB2", "DB2"],  # DB2 KPM is critical
+                "high_priority": ["KPMZOS", "MVS", "AKD"],  # System KPM + alternatives
+                "useful": ["CP_DB2", "ADB2", "DFSMS", "CSWKDPS"],  # Capacity + analytics
+                "description": "Database focus - KPMDB2 is essential"
+            },
+            "transactions": {
+                "essential": ["KPMCIC", "CICSMON"],  # CICS KPM + basic monitoring
+                "high_priority": ["KPMZOS", "AKC", "CICSUOW"],  # System KPM + transaction analysis
+                "useful": ["CP_CICS", "OMEG_CICSMON", "MVS"],  # Capacity + enhanced monitoring
+                "description": "Transaction focus - CICS KPM first"
+            },
+            "basic": {
+                "essential": ["KPMZOS"],  # Minimal: just system KPM
+                "high_priority": ["MVS", "DFSMS"],  # Basic system monitoring
+                "useful": ["KPMDB2", "DB2", "CICSMON"],  # Add technology-specific as needed
+                "description": "Minimal monitoring - KPM z/OS only"
+            }
+        }
+        
+        recommendations = focus_recommendations.get(focus_area.lower(), focus_recommendations["performance"])
+        
+        # Analyze what's missing
+        missing_essential = [c for c in recommendations["essential"] if c not in installed]
+        missing_high_priority = [c for c in recommendations["high_priority"] if c not in installed]
+        missing_useful = [c for c in recommendations["useful"] if c not in installed]
+        
+        # Create installation plan
+        installation_plan = []
+        if missing_essential:
+            installation_plan.append({
+                "phase": "Phase 1 - Critical (Install First)",
+                "components": missing_essential,
+                "reason": "Essential for basic monitoring in your focus area"
+            })
+        
+        if missing_high_priority:
+            installation_plan.append({
+                "phase": "Phase 2 - High Priority (Install Next)",
+                "components": missing_high_priority,
+                "reason": "Key performance metrics and advanced monitoring"
+            })
+        
+        if missing_useful:
+            installation_plan.append({
+                "phase": "Phase 3 - Enhancement (Install Later)",
+                "components": missing_useful[:5],  # Limit to top 5
+                "reason": "Additional capabilities and specialized analysis"
+            })
+        
+        # Calculate coverage
+        total_recommended = len(recommendations["essential"]) + len(recommendations["high_priority"])
+        installed_recommended = len([c for c in recommendations["essential"] + recommendations["high_priority"] if c in installed])
+        coverage_percentage = (installed_recommended / total_recommended * 100) if total_recommended > 0 else 0
+        
+        return _json_text({
+            "ok": True,
+            "focus_area": focus_area,
+            "focus_description": recommendations["description"],
+            "coverage_percentage": round(coverage_percentage, 1),
+            "installed_count": len(installed),
+            "total_components": len(components),
+            "installation_plan": installation_plan,
+            "next_action": installation_plan[0] if installation_plan else {"message": "All recommended components installed!"},
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
+@mcp.tool(
+    name="db2.kmp_assessment",
+    description="Assess KPM (Key Performance Metrics) component coverage and provide KPM-first installation guidance. Use when user asks about monitoring foundation or what to install first."
+)
+def kmp_assessment() -> TextContent:
+    t0 = time.time()
+    try:
+        # Get installed components
+        sql = f"""
+            SELECT COMPONENT_NAME, STATUS, DESCRIPTION
+            FROM {METADATA_SCHEMA}.DRLCOMPONENTS
+            WHERE COMPONENT_NAME LIKE '%KPM%' 
+               OR COMPONENT_NAME IN ('KPMZOS', 'KPMDB2', 'KPMCIC', 'AKD', 'AKC')
+               OR DESCRIPTION LIKE '%Key Performance%'
+            ORDER BY COMPONENT_NAME
+            WITH UR
+        """
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        
+        kmp_components = []
+        for row in rows:
+            kmp_components.append({
+                "component_name": _py(row[0]).strip() if _py(row[0]) else "",
+                "status": _py(row[1]).strip() if _py(row[1]) else "",
+                "description": _py(row[2]).strip() if _py(row[2]) else ""
+            })
+        
+        # Define core KPM components by technology
+        core_kmp = {
+            "z/OS System": {"component": "KPMZOS", "critical": True, "description": "Foundation - required for all other monitoring"},
+            "DB2": {"component": "KPMDB2", "critical": True, "description": "Essential for DB2 performance monitoring"},
+            "CICS": {"component": "KPMCIC", "critical": True, "description": "Essential for CICS transaction monitoring"},
+            "IMS": {"component": "KPM_IMS", "critical": False, "description": "IMS performance monitoring"},
+            "MQ": {"component": "KPMMQ", "critical": False, "description": "MQ performance monitoring"}
+        }
+        
+        # Check installation status
+        installed_kmp = [c["component_name"] for c in kmp_components if c["status"] == "I"]
+        
+        assessment = {}
+        critical_missing = []
+        
+        for tech, info in core_kmp.items():
+            comp_name = info["component"]
+            is_installed = comp_name in installed_kmp
+            assessment[tech] = {
+                "component": comp_name,
+                "installed": is_installed,
+                "critical": info["critical"],
+                "description": info["description"]
+            }
+            
+            if info["critical"] and not is_installed:
+                critical_missing.append({"tech": tech, "component": comp_name})
+        
+        # Calculate KPM coverage
+        critical_total = sum(1 for info in core_kmp.values() if info["critical"])
+        critical_installed = sum(1 for tech, status in assessment.items() if status["installed"] and status["critical"])
+        kmp_coverage = (critical_installed / critical_total * 100) if critical_total > 0 else 0
+        
+        # Generate recommendations
+        recommendations = []
+        
+        if not assessment["z/OS System"]["installed"]:
+            recommendations.append({
+                "priority": "URGENT",
+                "action": "Install KPMZOS immediately",
+                "reason": "Foundation component - required for all mainframe monitoring"
+            })
+        
+        for missing in critical_missing:
+            if missing["component"] != "KPMZOS":  # Already handled above
+                recommendations.append({
+                    "priority": "HIGH",
+                    "action": f"Install {missing['component']} for {missing['tech']}",
+                    "reason": f"Essential for {missing['tech']} performance monitoring"
+                })
+        
+        if kmp_coverage >= 100:
+            recommendations.append({
+                "priority": "INFO", 
+                "action": "KPM foundation complete - excellent performance monitoring coverage",
+                "reason": "All critical KPM components installed for performance management"
+            })
+        
+        return _json_text({
+            "ok": True,
+            "kmp_coverage_percentage": round(kmp_coverage, 1),
+            "critical_missing_count": len(critical_missing),
+            "assessment_by_technology": assessment,
+            "installed_kmp_components": installed_kmp,
+            "recommendations": recommendations,
+            "next_steps": "Install missing KPM components for complete performance monitoring coverage" if critical_missing else "KPM foundation complete - performance monitoring ready",
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
+@mcp.tool(
+    name="db2.component_parts",
+    description="Get sub-components/parts within a main component (e.g., DB2 has parts like 'DB2 Buffer Pool', 'DB2 Address Space'). Use when user asks about parts of a specific component."
+)
+def component_parts(component_name: str = None) -> TextContent:
+    t0 = time.time()
+    try:
+        where_clause = ""
+        params = []
+        
+        if component_name:
+            where_clause = "WHERE COMPONENT_NAME = ?"
+            params.append(component_name.upper())
+        
+        sql = f"""
+            SELECT COMPONENT_NAME, PART_NAME, STATUS, DESCRIPTION, TIME_INSTALLED, USER_ID
+            FROM {METADATA_SCHEMA}.DRLCOMP_PARTS
+            {where_clause}
+            ORDER BY COMPONENT_NAME, PART_NAME
+            WITH UR
+        """
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        
+        parts = []
+        for row in rows:
+            parts.append({
+                "component_name": _py(row[0]).strip() if _py(row[0]) else "",
+                "part_name": _py(row[1]).strip() if _py(row[1]) else "",
+                "status": _py(row[2]).strip() if _py(row[2]) else "",
+                "description": _py(row[3]).strip() if _py(row[3]) else "",
+                "time_installed": str(_py(row[4])) if _py(row[4]) else "",
+                "user_id": _py(row[5]).strip() if _py(row[5]) else ""
+            })
+        
+        # Group by component
+        components_parts = {}
+        for part in parts:
+            comp_name = part["component_name"]
+            if comp_name not in components_parts:
+                components_parts[comp_name] = []
+            components_parts[comp_name].append({
+                "part_name": part["part_name"],
+                "status": part["status"],
+                "description": part["description"],
+                "time_installed": part["time_installed"],
+                "user_id": part["user_id"]
+            })
+        
+        return _json_text({
+            "ok": True,
+            "component_filter": component_name.upper() if component_name else "ALL_COMPONENTS",
+            "total_parts": len(parts),
+            "components_count": len(components_parts),
+            "components_parts": components_parts,
+            "ms": int((time.time() - t0) * 1000)
+        })
+        
+    except Exception as e:
+        return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
+
+@mcp.tool(
+    name="db2.component_objects",
+    description="Get detailed objects (tables, views, procedures) within a component part from DRLCOMP_OBJECTS table. Use when user needs specific database objects details."
+)
+def component_objects(component_name: str = None, part_name: str = None) -> TextContent:
+    t0 = time.time()
+    try:
+        where_clauses = []
+        params = []
+        
+        if component_name:
+            where_clauses.append("COMPONENT_NAME = ?")
+            params.append(component_name.upper())
+        
+        if part_name:
+            where_clauses.append("PART_NAME = ?")
+            params.append(part_name.upper())
+        
+        where_clause = ""
+        if where_clauses:
+            where_clause = "WHERE " + " AND ".join(where_clauses)
+        
+        sql = f"""
+            SELECT COMPONENT_NAME, OBJECT_NAME, OBJECT_TYPE, MEMBER_NAME, PART_NAME, EXCLUDE_FLAG
+            FROM {METADATA_SCHEMA}.DRLCOMP_OBJECTS
+            {where_clause}
+            ORDER BY COMPONENT_NAME, PART_NAME, OBJECT_TYPE, OBJECT_NAME
+            FETCH FIRST 100 ROWS ONLY
+            WITH UR
+        """
+        
+        with _db2_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        
+        objects = []
+        for row in rows:
+            objects.append({
+                "component_name": _py(row[0]).strip() if _py(row[0]) else "",
+                "object_name": _py(row[1]).strip() if _py(row[1]) else "",
+                "object_type": _py(row[2]).strip() if _py(row[2]) else "",
+                "member_name": _py(row[3]).strip() if _py(row[3]) else "",
+                "part_name": _py(row[4]).strip() if _py(row[4]) else "",
+                "exclude_flag": _py(row[5]).strip() if _py(row[5]) else ""
+            })
+        
+        # Group by component and part
+        hierarchy = {}
+        for obj in objects:
+            comp_name = obj["component_name"]
+            part_name = obj["part_name"] or "NO_PART"
+            
+            if comp_name not in hierarchy:
+                hierarchy[comp_name] = {}
+            if part_name not in hierarchy[comp_name]:
+                hierarchy[comp_name][part_name] = []
+            
+            hierarchy[comp_name][part_name].append({
+                "object_name": obj["object_name"],
+                "object_type": obj["object_type"],
+                "member_name": obj["member_name"],
+                "exclude_flag": obj["exclude_flag"]
+            })
+        
+        return _json_text({
+            "ok": True,
+            "component_filter": component_name.upper() if component_name else "ALL_COMPONENTS",
+            "part_filter": part_name.upper() if part_name else "ALL_PARTS",
+            "total_objects": len(objects),
+            "component_hierarchy": hierarchy,
             "ms": int((time.time() - t0) * 1000)
         })
         
@@ -642,6 +1200,254 @@ def problem_areas(days: int = 7, max_rows: int = 10) -> TextContent:
     except Exception as e:
         return _json_text({"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)})
 
+
+# -----------------------------------------------------------------------------
+# MCP Resources - Structured data the agent can reference
+# -----------------------------------------------------------------------------
+@mcp.resource("db2://health-levels")
+async def health_levels_resource() -> str:
+    """Health level reference guide for IZPCA monitoring"""
+    return json.dumps({
+        "health_levels": {
+            "0": {"name": "Not Applicable", "description": "Rule does not apply to this system/component", "action": "No action needed"},
+            "1": {"name": "Good", "description": "Healthy - no issues detected", "action": "Continue monitoring"},
+            "2": {"name": "Warning", "description": "Needs monitoring - potential issue", "action": "Investigate and monitor closely"},
+            "3": {"name": "Critical", "description": "Requires immediate attention", "action": "Take corrective action within 24 hours"},
+            "4": {"name": "Severe Critical", "description": "Urgent - system may be at risk", "action": "Take immediate action - escalate if needed"}
+        },
+        "rule_groups": {
+            "DB2Z": "Database Performance - affects customer transactions",
+            "DASD": "Storage Systems - affects system availability", 
+            "LPAR": "Resource Allocation - affects operational efficiency",
+            "WORK": "Workload Management - affects system throughput",
+            "SYID": "System Configuration - affects compliance",
+            "MMRY": "Memory Management - affects performance",
+            "PATH": "Network Paths - affects connectivity",
+            "PLEX": "Sysplex Configuration - affects availability"
+        }
+    })
+
+@mcp.resource("db2://component-hierarchy")
+async def component_hierarchy_resource() -> str:
+    """Component structure reference for understanding the 3-level hierarchy"""
+    return json.dumps({
+        "hierarchy_levels": {
+            "1": {
+                "name": "Main Components",
+                "description": "High-level technology components (DB2, CICS, etc.)",
+                "table": "DRLCOMPONENTS",
+                "examples": ["DB2", "CICS", "CP_DB2", "KPMDB2"]
+            },
+            "2": {
+                "name": "Component Parts", 
+                "description": "Sub-components within main components",
+                "table": "DRLCOMP_PARTS",
+                "examples": ["DB2 Buffer Pool", "DB2 Address Space", "CICS Monitoring"]
+            },
+            "3": {
+                "name": "Component Objects",
+                "description": "Database objects (tables, views, procedures)",
+                "table": "DRLCOMP_OBJECTS", 
+                "examples": ["A_DB2_BP_I", "LOOKUP", "TABLE", "UPDATE"]
+            }
+        },
+        "component_aspects": {
+            "Core": "Main technology component",
+            "Analytics": "ADB2, AZPM - data analysis and reporting", 
+            "Performance_Monitoring": "KPM*, AKD - key performance metrics",
+            "Capacity_Planning": "CP_* - capacity and resource planning",
+            "Monitoring": "*MON - general monitoring and alerting"
+        }
+    })
+
+@mcp.resource("db2://schema-summary") 
+async def schema_summary_resource() -> str:
+    """Complete database schema reference - all tables and columns"""
+    return json.dumps({
+        "schemas": {
+            "PRL": "Main data schema - health rules and metrics",
+            "PRLSYS": "Metadata schema - component definitions"
+        },
+        "tables": {
+            "KPMZ_RULE_VALUES_V": {
+                "schema": "PRL",
+                "description": "Current rule values and health levels",
+                "columns": [
+                    "RULE_GROUP", "DATE", "RULE_ID", "RULE_METRIC", "RULE_AREA",
+                    "RULE_VALUE", "RULE_LEVEL", "MVS_SYSTEM_ID", "LPAR_NAME",
+                    "PROCESSOR_TYPE", "CAPACITY_GRP_NM", "SYSPLEX_NAME"
+                ],
+                "key_columns": ["MVS_SYSTEM_ID", "RULE_ID", "DATE", "RULE_LEVEL"],
+                "purpose": "Primary source for system health metrics - shows current rule violations",
+                "usage": "Filter by RULE_LEVEL >= 2 for problems, join with KPMZ_RULES for descriptions"
+            },
+            "KPMZ_RULES": {
+                "schema": "PRL",
+                "description": "Rule definitions and descriptions",
+                "columns": ["START_DATE", "END_DATE", "RULE_ID", "RULE_UOM", "RULE_GROUP", "RULE_DESCRIPTION"],
+                "key_columns": ["RULE_ID", "RULE_GROUP", "RULE_DESCRIPTION"],
+                "purpose": "Explains what each rule monitors - join with RULE_VALUES_V",
+                "usage": "Use to translate RULE_ID to human-readable descriptions"
+            },
+            "KPMZ_CP_SCWL_HV": {
+                "schema": "PRL", 
+                "description": "LPAR performance metrics (CPU/storage)",
+                "columns": [
+                    "DATE", "TIME", "SYSPLEX_NAME", "MVS_SYSTEM_ID", "PROCESSOR_TYPE",
+                    "CPU_USED_TOT", "CPU_DISPATCH_SEC", "CSTOR_AVLBL_AVG", "LPAR_NAME"
+                ],
+                "key_columns": ["MVS_SYSTEM_ID", "LPAR_NAME", "DATE", "TIME"],
+                "purpose": "Raw performance data - CPU usage and storage metrics",
+                "usage": "Use for performance analysis and capacity planning"
+            },
+            "KPMZ_RULE_LEVELS": {
+                "schema": "PRL",
+                "description": "Rule threshold definitions",
+                "columns": [
+                    "RULE_ID", "RULE_METRIC", "RULE_LEVEL", "RULE_LEVEL_LOW", "RULE_LEVEL_HIGH", "DESCRIPTION"
+                ],
+                "key_columns": ["RULE_ID", "RULE_LEVEL"],
+                "purpose": "Defines thresholds for when rules trigger at different levels",
+                "usage": "Shows what values cause level 1, 2, 3, 4 health alerts"
+            },
+            "DRLCOMPONENTS": {
+                "schema": "PRLSYS",
+                "description": "Component installation status",
+                "columns": ["COMPONENT_NAME", "STATUS", "DESCRIPTION", "TIME_INSTALLED", "USER_ID"],
+                "key_columns": ["COMPONENT_NAME", "STATUS"],
+                "purpose": "Lists all available components and their installation status",
+                "usage": "STATUS='I' = Installed, empty = Not Installed"
+            },
+            "DRLCOMP_PARTS": {
+                "schema": "PRLSYS",
+                "description": "Component parts and health checks",
+                "columns": ["COMPONENT_NAME", "PART_NAME", "STATUS", "DESCRIPTION", "TIME_INSTALLED", "USER_ID"],
+                "key_columns": ["COMPONENT_NAME", "PART_NAME", "STATUS"],
+                "purpose": "Sub-components within main components (e.g., DB2 Buffer Pool, Address Space)",
+                "usage": "Shows detailed parts of each installed component"
+            },
+            "DRLCOMP_OBJECTS": {
+                "schema": "PRLSYS", 
+                "description": "Component objects (tables, views, procedures)",
+                "columns": ["COMPONENT_NAME", "OBJECT_NAME", "OBJECT_TYPE", "MEMBER_NAME", "PART_NAME", "EXCLUDE_FLAG"],
+                "key_columns": ["COMPONENT_NAME", "PART_NAME", "OBJECT_TYPE", "OBJECT_NAME"],
+                "purpose": "Database objects within component parts - tables, views, lookup tables, etc.",
+                "usage": "Shows actual database objects that each component part manages"
+            }
+        },
+        "common_queries": {
+            "health_overview": "SELECT MVS_SYSTEM_ID, COUNT(*) as issues FROM KPMZ_RULE_VALUES_V WHERE RULE_LEVEL >= 2 GROUP BY MVS_SYSTEM_ID",
+            "rule_descriptions": "SELECT r.RULE_ID, r.RULE_DESCRIPTION, rv.RULE_LEVEL FROM KPMZ_RULES r JOIN KPMZ_RULE_VALUES_V rv ON r.RULE_ID = rv.RULE_ID",
+            "installed_components": "SELECT COMPONENT_NAME, DESCRIPTION, TIME_INSTALLED FROM DRLCOMPONENTS WHERE STATUS = 'I'",
+            "system_performance": "SELECT MVS_SYSTEM_ID, AVG(CPU_USED_TOT), AVG(CSTOR_AVLBL_AVG) FROM KPMZ_CP_SCWL_HV GROUP BY MVS_SYSTEM_ID"
+        }
+    })
+
+@mcp.resource("db2://component-priorities")
+async def component_priorities_resource() -> str:
+    """Component importance and installation priorities by technology area"""
+    return json.dumps({
+        "priority_levels": {
+            "ESSENTIAL": "Core monitoring - install first",
+            "IMPORTANT": "Key performance metrics - highly recommended", 
+            "USEFUL": "Additional analysis capabilities",
+            "OPTIONAL": "Specialized use cases"
+        },
+        "technology_priorities": {
+            "DB2": {
+                "ESSENTIAL": [
+                    {"component": "DB2", "purpose": "Core DB2 monitoring", "why_essential": "Basic DB2 health and performance tracking"}
+                ],
+                "IMPORTANT": [
+                    {"component": "KPMDB2", "purpose": "Key Performance Metrics for DB2", "why_important": "Critical performance indicators, bottleneck identification"},
+                    {"component": "AKD", "purpose": "DB2 Analytics (Alternative KPM)", "why_important": "Performance monitoring if KPMDB2 not available"}
+                ],
+                "USEFUL": [
+                    {"component": "CP_DB2", "purpose": "Capacity Planning for DB2", "why_useful": "Future growth planning, resource optimization"},
+                    {"component": "ADB2", "purpose": "DB2 Analytics", "why_useful": "Advanced reporting and historical analysis"}
+                ],
+                "OPTIONAL": [
+                    {"component": "CSWKDPS", "purpose": "DB2 Workload Statistics", "why_optional": "Detailed workload analysis"}
+                ]
+            },
+            "CICS": {
+                "ESSENTIAL": [
+                    {"component": "CICSMON", "purpose": "Core CICS Monitoring", "why_essential": "Basic CICS transaction monitoring"}
+                ],
+                "IMPORTANT": [
+                    {"component": "CICSUOW", "purpose": "CICS Transaction Analysis", "why_important": "Transaction performance and unit-of-work tracking"},
+                    {"component": "AKC", "purpose": "CICS Key Performance Metrics", "why_important": "Critical CICS performance indicators"}
+                ],
+                "USEFUL": [
+                    {"component": "CP_CICS", "purpose": "CICS Capacity Planning", "why_useful": "Transaction volume planning"},
+                    {"component": "OMEG_CICSMON", "purpose": "OMEGAMON CICS Monitoring", "why_useful": "Enhanced CICS monitoring"}
+                ]
+            },
+            "z/OS_SYSTEM": {
+                "ESSENTIAL": [
+                    {"component": "MVS", "purpose": "z/OS System Monitoring", "why_essential": "Core system health and performance"},
+                    {"component": "KPMZOS", "purpose": "z/OS Key Performance Metrics", "why_essential": "Critical system performance indicators"}
+                ],
+                "IMPORTANT": [
+                    {"component": "MVSPERF", "purpose": "z/OS Performance Management", "why_important": "System performance analysis and tuning"},
+                    {"component": "DFSMS", "purpose": "Storage Management", "why_important": "Storage allocation and performance"}
+                ],
+                "USEFUL": [
+                    {"component": "CP", "purpose": "z/OS Capacity Planning", "why_useful": "System capacity and growth planning"},
+                    {"component": "MVSAC", "purpose": "z/OS Job/Step Accounting", "why_useful": "Resource usage tracking"}
+                ]
+            },
+            "IMS": {
+                "IMPORTANT": [
+                    {"component": "CSQVE10C", "purpose": "IMS 14.1 Data Collection", "why_important": "Current IMS version monitoring"},
+                    {"component": "KPM_IMS", "purpose": "IMS Key Performance Metrics", "why_important": "IMS transaction performance"}
+                ],
+                "USEFUL": [
+                    {"component": "CP_IMS", "purpose": "IMS Capacity Planning", "why_useful": "IMS growth planning"}
+                ]
+            },
+            "NETWORK": {
+                "IMPORTANT": [
+                    {"component": "NWAVAIL", "purpose": "Network Availability", "why_important": "Network uptime monitoring"},
+                    {"component": "NWSF", "purpose": "Network Session Failure", "why_important": "Connection failure tracking"}
+                ],
+                "USEFUL": [
+                    {"component": "TCPIP", "purpose": "TCP/IP Monitoring", "why_useful": "Network protocol analysis"}
+                ]
+            }
+        },
+        "installation_sequence": {
+            "new_environment": [
+                "1. For PERFORMANCE focus: Start with KPM components (KPMZOS foundation, then KPMDB2, KPMCIC)",
+                "2. For CAPACITY focus: Start with CP components (CP core, then CP_DB2, CP_CICS)",
+                "3. Install basic monitoring for your technologies (DB2, CICSMON, MVS)",
+                "4. Add specialized analytics and advanced monitoring as needed",
+                "5. Areas are independent - choose based on your primary need"
+            ],
+            "existing_environment": [
+                "1. Identify your primary focus: Performance management OR Capacity planning",
+                "2. For performance issues: prioritize KPM components",
+                "3. For capacity concerns: prioritize CP components", 
+                "4. Both areas provide value independently"
+            ]
+        },
+        "focus_area_guidance": {
+            "performance_management": "Use KPM components (KPMZOS, KPMDB2, KPMCIC) for real-time performance monitoring and problem diagnosis",
+            "capacity_planning": "Use CP components (CP, CP_DB2, CP_CICS) for resource planning and growth forecasting",
+            "note": "These are separate functional areas - install based on your specific business needs"
+        },
+        "technology_dependencies": {
+            "DB2": ["MVS (z/OS system monitoring required)", "DFSMS (storage management)"],
+            "CICS": ["MVS (z/OS system monitoring required)"],
+            "IMS": ["MVS (z/OS system monitoring required)", "DFSMS (storage management)"]
+        },
+        "component_usage_guidance": {
+            "performance_issues": ["Start with KPM components (KPMDB2, KPMZOS)", "Add specific monitoring (CICSMON for CICS issues)"],
+            "capacity_planning": ["Use CP_* components", "Requires historical data from KPM components"],
+            "problem_diagnosis": ["Essential + Important components needed", "Analytics components helpful for trends"],
+            "executive_reporting": ["KPM components provide business metrics", "Management_summary tool translates technical data"]
+        }
+    })
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

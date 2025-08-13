@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Multi-MCP REPL (native Ollama)
-- Spawns DB2 server via STDIO:
-    1) DB2 db2_mcp.py
-- Keeps both sessions open; merges tools for one LangGraph agent
+MCP DB2 Health Monitoring REPL
+- Spawns DB2 MCP server via STDIO
+- LangChain integration with Ollama for AI-powered analysis
 - Commands:
     /tools                 -> list all tool names
     /health                -> call db2.healthcheck (if present)
-    /toy                   -> call toy.ping
     /systems [days]        -> call db2.show_systems 
     /health [system_id]    -> call db2.system_health or db2.all_systems_health
     /problems              -> call db2.problem_areas
     /call <tool> <json>    -> call a tool directly with JSON args
     /manifest              -> summarize db2 schema manifest if available
     /ids [days]            -> call db2.discover_context
+    /components            -> call db2.installed_components  
+    /resources             -> view available MCP resources
     /help  /exit
 """
 
@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.resources import load_mcp_resources
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from langchain_ollama import ChatOllama
@@ -34,15 +35,23 @@ load_dotenv()
 DB2_DIR = os.getenv("MCP_SERVER_DIR", r"C:\Users\danje\Projects\mcp-experiment")
 DB2_PY  = os.getenv("MCP_SERVER_PATH", rf"{DB2_DIR}\servers\db2_mcp.py")
 
-# TOY_DIR = os.getenv("TOY_SERVER_DIR", r"C:\Users\danje\Projects\mcp-experiment\servers")
-# TOY_PY  = os.getenv("TOY_SERVER_PATH", rf"{TOY_DIR}\toy_server.py")
 
 # --- ollama ---
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3:14b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:28114")
 
 SYSTEM_HINT = (
-    "You have DB2 mainframe health monitoring tools available.\n\n"
+    "You have mainframe health monitoring tools available.\n\n"
+    "IMPORTANT NAMING CLARIFICATION:\n"
+    "- Tools named 'db2.*' = Database query tools (for accessing DB2 database)\n"
+    "- 'DB2 component' = Mainframe monitoring component (different from db2.* tools)\n"
+    "- 'KPMDB2 component' = Performance monitoring component for DB2 technology\n\n"
+    "CRITICAL: You have MCP_RESOURCES with immediate answers - DO NOT call tools for explanations:\n"
+    "- Health levels (0-4) with actions are in MCP_RESOURCES - answer directly\n"
+    "- Component differences (DB2 vs KPMDB2) are in MCP_RESOURCES component_aspects\n"
+    "- Schema info (tables, columns) is in MCP_RESOURCES - answer directly\n"
+    "- Component priorities are in MCP_RESOURCES - use for recommendations\n"
+    "- ONLY call db2.* tools for live database queries (current metrics, status)\n\n"
     "HEALTH LEVELS (always explain when first mentioned):\n"
     "- Level 0: Not Applicable\n"
     "- Level 1: Good (healthy)\n"
@@ -284,6 +293,145 @@ def _format_discover_output(json_text: str):
         print(f"Format error: {e}")
         print(json_text)
 
+def _format_components_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        total = data.get("total_components", 0)
+        installed = data.get("installed_components", [])
+        not_installed = data.get("not_installed_components", [])
+        other = data.get("other_status_components", [])
+        
+        print(f"Component Status Overview")
+        print(f"Total components: {total}")
+        print(f"- Installed: {len(installed)}")
+        print(f"- Not installed: {len(not_installed)}")
+        if other:
+            print(f"- Other status: {len(other)}")
+        print()
+        
+        if installed:
+            print("Installed Components:")
+            # Limit to first 20 to prevent overwhelming output
+            for i, comp in enumerate(installed[:20], 1):
+                desc = comp.get("description", "")[:60] + "..." if len(comp.get("description", "")) > 60 else comp.get("description", "")
+                time_installed = comp.get("time_installed", "")[:10] if comp.get("time_installed") else ""  # Just date part
+                user_id = comp.get("user_id", "")
+                
+                print(f"{i}. {comp['component_name']} [INSTALLED]")
+                if desc:
+                    print(f"   {desc}")
+                if time_installed or user_id:
+                    install_info = []
+                    if time_installed:
+                        install_info.append(f"Installed: {time_installed}")
+                    if user_id:
+                        install_info.append(f"By: {user_id}")
+                    print(f"   {' | '.join(install_info)}")
+            
+            if len(installed) > 20:
+                print(f"   ... and {len(installed) - 20} more installed components")
+            print()
+        
+        if not_installed:
+            print("Not Installed Components:")
+            # Limit to first 15 to prevent overwhelming output
+            for i, comp in enumerate(not_installed[:15], 1):
+                print(f"{i}. {comp['component_name']}")
+            
+            if len(not_installed) > 15:
+                print(f"   ... and {len(not_installed) - 15} more not installed components")
+            print()
+            
+        if other:
+            print("Other Status Components:")
+            for i, comp in enumerate(other, 1):
+                print(f"{i}. {comp['component_name']} [{comp['status']}]")
+                
+    except Exception as e:
+        print(f"Format error: {e}")
+        print(json_text)
+
+def _format_find_components_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        search_pattern = data.get("search_pattern", "")
+        total_found = data.get("total_found", 0)
+        installed_by_aspect = data.get("installed_by_aspect", {})
+        not_installed_by_aspect = data.get("not_installed_by_aspect", {})
+        
+        print(f"{search_pattern.upper()}-Related Components")
+        print(f"Total found: {total_found}")
+        print()
+        
+        if installed_by_aspect:
+            print("INSTALLED Components by Aspect:")
+            for aspect, components in installed_by_aspect.items():
+                print(f"\\n📊 {aspect}:")
+                for comp in components:
+                    time_installed = comp.get("time_installed", "")[:10] if comp.get("time_installed") else ""
+                    user_id = comp.get("user_id", "")
+                    install_info = f" (Installed: {time_installed} by {user_id})" if time_installed else ""
+                    print(f"   ✅ {comp['component_name']}: {comp['description'][:50]}...{install_info}")
+        
+        if not_installed_by_aspect:
+            print("\\nNOT INSTALLED Components by Aspect:")
+            for aspect, components in not_installed_by_aspect.items():
+                print(f"\\n📋 {aspect}:")
+                for comp in components[:5]:  # Limit to 5 per aspect
+                    print(f"   ❌ {comp['component_name']}: {comp['description'][:50]}...")
+                if len(components) > 5:
+                    print(f"   ... and {len(components) - 5} more in this aspect")
+                    
+    except Exception as e:
+        print(f"Format error: {e}")
+        print(json_text)
+
+def _format_recommendations_output(json_text: str):
+    try:
+        data = json.loads(json_text)
+        if not data.get("ok"):
+            print(f"Error: {data.get('error', 'Unknown error')}")
+            return
+            
+        focus_area = data.get("focus_area", "")
+        coverage = data.get("coverage_percentage", 0)
+        installation_plan = data.get("installation_plan", [])
+        next_action = data.get("next_action", {})
+        
+        print(f"Component Recommendations - {focus_area.upper()} Focus")
+        print(f"Coverage: {coverage}% of recommended components installed")
+        print()
+        
+        if installation_plan:
+            print("📋 Installation Plan:")
+            for phase in installation_plan:
+                print(f"\\n{phase['phase']}:")
+                for comp in phase['components']:
+                    print(f"   • {comp}")
+                print(f"   Reason: {phase['reason']}")
+            
+            print(f"\\n🎯 Next Action:")
+            if "components" in next_action:
+                print(f"   {next_action['phase']}")
+                print(f"   Components: {', '.join(next_action['components'])}")
+            else:
+                print(f"   {next_action.get('message', 'No action needed')}")
+        else:
+            print("✅ All recommended components are installed!")
+            print("Your monitoring coverage is complete for this focus area.")
+            
+    except Exception as e:
+        print(f"Format error: {e}")
+        print(json_text)
+
 async def _direct_call(tools, name: str, args: dict):
     t = await _get_tool_by_name(tools, name)
     if not t:
@@ -317,20 +465,64 @@ async def _direct_call(tools, name: str, args: dict):
             _format_problems_output(text)
         elif name == "db2.discover_context":
             _format_discover_output(text)
+        elif name == "db2.installed_components":
+            _format_components_output(text)
+        elif name == "db2.find_components":
+            _format_find_components_output(text)
+        elif name == "db2.component_recommendations":
+            _format_recommendations_output(text)
         else:
             print(text)
     finally:
         spinner.stop()
 
-async def repl(tools, llm):
+async def _load_mcp_resources(session):
+    """Load MCP resources and return as context strings"""
+    try:
+        resources = await load_mcp_resources(session)
+        resource_context = []
+        
+        for resource in resources:
+            # Convert LangChain Blob to text
+            if hasattr(resource, 'as_string'):
+                content = resource.as_string()
+            else:
+                content = str(resource)
+            resource_context.append(f"RESOURCE: {content}")
+        
+        return "\n".join(resource_context) if resource_context else ""
+    except Exception as e:
+        print(f"Warning: Could not load MCP resources: {e}")
+        return ""
+
+async def repl(tools, llm, resource_context=""):
     agent = create_react_agent(llm, tools)
 
     manifest = await _preload_manifest(tools)
     sys_msgs = [SystemMessage(content=SYSTEM_HINT)]
     if manifest:
         sys_msgs.append(SystemMessage(content=f"DB2_SCHEMA_MANIFEST:\n{json.dumps(manifest, separators=(',',':'))}"))
+    
+    # Add MCP resources as context
+    if resource_context:
+        # Make resources more prominent and specific
+        resource_instruction = (
+            "MANDATORY: Use the following MCP_RESOURCES for instant answers - DO NOT call tools for these:\n\n"
+            "FOR HEALTH LEVEL QUESTIONS: Level 3 = Critical (requires immediate attention, take corrective action within 24 hours)\n"
+            "FOR COMPONENT DIFFERENCES: DB2 = Core component, KPMDB2 = Performance_Monitoring (key performance metrics)\n"
+            "FOR SCHEMA QUESTIONS: All table/column info is below\n\n"
+            "If user asks about health levels, component differences, or schema - answer from below data ONLY:\n\n"
+            f"{resource_context}\n\n"
+            "ONLY call db2.* tools for live database queries (current metrics, system status, installation checks)."
+        )
+        sys_msgs.append(SystemMessage(content=resource_instruction))
+        print("Loaded MCP resources: health-levels, component-hierarchy, schema-summary")
+        # Debug: Show first 200 chars of resources
+        print(f"Debug - Resource content preview: {resource_context[:200]}...")
+    else:
+        print("Warning: No MCP resources loaded")
 
-    print("\nCommands: /tools  /health  /systems [days]  /health [system_id]  /problems  /ids [days]  /manifest  /call <tool> <json>  /help  /exit")
+    print("\nCommands: /tools  /health  /systems [days]  /health [system_id]  /problems  /ids [days]  /components  /resources  /manifest  /call <tool> <json>  /help  /exit")
     print("Tip: free text -> agent with all tools.\n")
 
     while True:
@@ -349,7 +541,7 @@ async def repl(tools, llm):
             break
 
         if q.lower().startswith("/help"):
-            print("Commands: /tools  /health  /systems [days]  /health [system_id]  /problems  /ids [days]  /manifest  /call <tool> <json>  /exit")
+            print("Commands: /tools  /health  /systems [days]  /health [system_id]  /problems  /ids [days]  /components  /resources  /manifest  /call <tool> <json>  /exit")
             continue
 
         if q.lower().startswith("/tools"):
@@ -360,9 +552,6 @@ async def repl(tools, llm):
             await _direct_call(tools, "db2.healthcheck", {})
             continue
 
-        # if q.lower().startswith("/toy"):
-        #     await _direct_call(tools, "toy.ping", {})
-        #     continue
 
         if q.lower().startswith("/manifest"):
             if manifest:
@@ -394,6 +583,18 @@ async def repl(tools, llm):
             parts = q.split()
             days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
             await _direct_call(tools, "db2.discover_context", {"days": days})
+            continue
+
+        if q.lower().startswith("/components"):
+            await _direct_call(tools, "db2.installed_components", {})
+            continue
+
+        if q.lower().startswith("/resources"):
+            if resource_context:
+                print("Available MCP Resources:")
+                print(resource_context[:1000] + "..." if len(resource_context) > 1000 else resource_context)
+            else:
+                print("No MCP resources loaded")
             continue
 
         if q.lower().startswith("/call "):
@@ -447,6 +648,9 @@ async def main():
             print("DB2 MCP session initialized")
 
             tools = await load_mcp_tools(s1)  # db2 server tools
+            
+            # Load MCP resources and add to system context
+            resource_context = await _load_mcp_resources(s1)
 
             llm = ChatOllama(
                 model=OLLAMA_MODEL,
@@ -455,7 +659,7 @@ async def main():
                 timeout=60.0,
             ).bind(stop=["</think>"])
 
-            await repl(tools, llm)
+            await repl(tools, llm, resource_context)
 
 if __name__ == "__main__":
     asyncio.run(main())
